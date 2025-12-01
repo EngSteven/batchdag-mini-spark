@@ -6,27 +6,39 @@ const (
 	MaxRetries = 3
 )
 
+// --- Métricas y Observabilidad ---
+
+// SystemMetrics contiene datos de rendimiento del nodo
+type SystemMetrics struct {
+	CPUPercent  float64 `json:"cpu_usage"`    // Uso de CPU simulado o real
+	MemoryUsage uint64  `json:"memory_usage"` // Bytes en uso (Alloc)
+	ActiveTasks int     `json:"active_tasks"` // Número de goroutines/tareas ejecutando
+}
+
+// --- Estructuras de Coordinación ---
 
 // WorkerInfo representa un nodo trabajador registrado en el Master
 type WorkerInfo struct {
-	ID        string    `json:"id"`
-	URL       string    `json:"url"` // Dirección IP:Puerto del worker para recibir tareas
-	LastHeartbeat time.Time `json:"last_heartbeat"`
-	Status    string    `json:"status"` // "UP", "DOWN"
+	ID            string        `json:"id"`
+	URL           string        `json:"url"`
+	LastHeartbeat time.Time     `json:"last_heartbeat"`
+	Status        string        `json:"status"`  // "UP", "DOWN"
+	Metrics       SystemMetrics `json:"metrics"` // <--- NUEVO: Métricas del worker
 }
 
 // RegisterRequest es el JSON que envía el worker al iniciar
 type RegisterRequest struct {
 	ID   string `json:"id"`
-	Port int    `json:"port"` // Puerto donde el worker escucha tareas
+	Port int    `json:"port"`
 }
 
-// HeartbeatRequest señal de vida
+// HeartbeatRequest señal de vida con métricas
 type HeartbeatRequest struct {
-	ID string `json:"id"`
+	ID      string        `json:"id"`
+	Metrics SystemMetrics `json:"metrics"` // <--- NUEVO: Enviar métricas en cada latido
 }
 
-// --- Estructuras para Definición de Jobs (Batch) ---
+// --- Estructuras de Jobs y Tareas ---
 
 // JobRequest mapea el JSON enviado por el cliente
 type JobRequest struct {
@@ -35,63 +47,66 @@ type JobRequest struct {
 	Parallelism int    `json:"parallelism"`
 }
 
-
-// DAG representa un grafo acíclico dirigido de operaciones a ejecutar
 type DAG struct {
-	Nodes []DAGNode   `json:"nodes"`
-	Edges [][]string  `json:"edges"` // Lista de pares ["origen", "destino"]
+	Nodes []DAGNode  `json:"nodes"`
+	Edges [][]string `json:"edges"`
 }
 
-// DAGNode representa una operación en el DAG
 type DAGNode struct {
 	ID         string `json:"id"`
-	Op         string `json:"op"` // "read_csv", "map", "reduce_by_key", etc.
-	Fn         string `json:"fn,omitempty"` // Nombre de la función a ejecutar
-	Path       string `json:"path,omitempty"` // Para inputs
+	Op         string `json:"op"`
+	Fn         string `json:"fn,omitempty"`
+	Path       string `json:"path,omitempty"`
 	Partitions int    `json:"partitions,omitempty"`
-	Key        string `json:"key,omitempty"` // Para reduce/join
+	Key        string `json:"key,omitempty"`
 }
 
-// Job almacena el estado completo de un trabajo en el Master
 type Job struct {
-	ID        string      `json:"id"`
-	Name      string      `json:"name"`
-	Status    string      `json:"status"` // "ACCEPTED", "RUNNING", "COMPLETED", "FAILED"
-	Graph     DAG         `json:"dag"`
-	Submitted time.Time   `json:"submitted_at"`
-	Completed time.Time   `json:"completed_at,omitempty"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Status    string    `json:"status"`
+	Graph     DAG       `json:"dag"`
+	Submitted time.Time `json:"submitted_at"`
+	Completed time.Time `json:"completed_at,omitempty"`
 }
 
-
-// Task representa una unidad de trabajo enviada a un worker
 type Task struct {
-	ID        string   `json:"id"`
-	JobID     string   `json:"job_id"`
-	NodeID    string   `json:"node_id"` // ID del nodo en el DAG (ej: "read")
-	Op        string   `json:"op"`      // Operación: "read_csv", "map", etc.
-	Fn        string   `json:"fn"`      // Función a aplicar
-	Args      []string `json:"args"`    // Argumentos extra (ej: path archivo)
+	ID         string   `json:"id"`
+	JobID      string   `json:"job_id"`
+	NodeID     string   `json:"node_id"`
+	Op         string   `json:"op"`
+	Fn         string   `json:"fn"`
+	Args       []string `json:"args"`
 	InputFiles []string `json:"input_files"`
-	Partition int      `json:"partition"`
-	Attempt    int      `json:"attempt"`
+	Partition  int      `json:"partition"`
+	Attempt    int      `json:"attempt"` // Para reintentos
 }
 
-// TaskResult reporte del worker al master
 type TaskResult struct {
-	ID        string `json:"id"`        // ID de la Tarea
-	JobID     string `json:"job_id"`
-	NodeID    string `json:"node_id"`
-	Status    string `json:"status"`    // "COMPLETED", "FAILED"
-	Result    string `json:"result"`    // (Opcional) Path de salida o mensaje
-	ErrorMsg  string `json:"error_msg,omitempty"`
+	ID       string `json:"id"`
+	JobID    string `json:"job_id"`
+	NodeID   string `json:"node_id"`
+	Status   string `json:"status"`
+	Result   string `json:"result"`
+	ErrorMsg string `json:"error_msg,omitempty"`
 }
 
-// JobStatusResponse para la API GET
+// --- Respuestas de API ---
+
+// JobStatusResponse enriquecido con progreso y métricas
 type JobStatusResponse struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
 	Status       string            `json:"status"`
 	Submitted    time.Time         `json:"submitted_at"`
 	DurationSecs float64           `json:"duration_secs"`
-	Progress     map[string]string `json:"node_status"` // NodeID -> Status
+	Progress     float64           `json:"progress_percent"` // <--- NUEVO: % de avance (0-100)
+	NodeStatus   map[string]string `json:"node_status"`      // Detalle por nodo
+	Failures     int               `json:"failure_count"`    // <--- NUEVO: Contador de fallos
+}
+
+// JobResultsResponse para la descarga de resultados finales
+type JobResultsResponse struct {
+	JobID   string            `json:"job_id"`
+	Outputs map[string]string `json:"outputs"` // NodeID -> FilePath
 }

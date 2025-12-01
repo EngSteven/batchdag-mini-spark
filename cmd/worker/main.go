@@ -6,19 +6,23 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"mini-spark/internal/common"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 )
 
 var (
-	masterURL  = "http://localhost:8080"
-	workerPort = flag.Int("port", 9001, "Puerto del worker")
-	outputDir  = "/tmp/mini-spark"
+	masterURL   = "http://localhost:8080"
+	workerPort  = flag.Int("port", 9001, "Puerto del worker")
+	outputDir   = "/tmp/mini-spark"
+	activeTasks int32 = 0 // Contador atómico de tareas activas
 )
 
 // --- UDFs (Funciones de Usuario) ---
@@ -28,7 +32,7 @@ var mapFunctions = map[string]func(string) string{
 }
 
 var filterFunctions = map[string]func(string) bool{
-	"long_words": func(s string) bool { return len(s) > 4 }, // Ejemplo: filtrar palabras cortas
+	"long_words": func(s string) bool { return len(s) > 4 },
 }
 
 var flatMapFunctions = map[string]func(string) []string{
@@ -59,10 +63,31 @@ func registerWorker(id string) error {
 }
 
 func sendHeartbeat(id string) {
-	req := common.HeartbeatRequest{ID: id}
-	data, _ := json.Marshal(req)
 	for {
-		http.Post(masterURL+"/heartbeat", "application/json", bytes.NewBuffer(data))
+		// 1. Recolectar métricas del sistema
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+
+		metrics := common.SystemMetrics{
+			// Usamos el número de gorutinas como proxy simple de carga de CPU
+			CPUPercent: float64(runtime.NumGoroutine()),
+			// Memoria asignada en bytes
+			MemoryUsage: m.Alloc,
+			// Tareas de mini-spark ejecutándose
+			ActiveTasks: int(atomic.LoadInt32(&activeTasks)),
+		}
+
+		// 2. Enviar Heartbeat con métricas
+		req := common.HeartbeatRequest{ID: id, Metrics: metrics}
+		data, _ := json.Marshal(req)
+		
+		resp, err := http.Post(masterURL+"/heartbeat", "application/json", bytes.NewBuffer(data))
+		if err != nil {
+			fmt.Printf("[WORKER %d] Error enviando heartbeat: %v\n", *workerPort, err)
+		} else {
+			resp.Body.Close()
+		}
+		
 		time.Sleep(3 * time.Second)
 	}
 }
@@ -80,6 +105,10 @@ func taskHandler(w http.ResponseWriter, r *http.Request) {
 // --- EJECUCIÓN PRINCIPAL ---
 
 func executeTask(task common.Task) {
+	// Registrar inicio de tarea
+	atomic.AddInt32(&activeTasks, 1)
+	defer atomic.AddInt32(&activeTasks, -1) // Asegurar decremento al salir
+
 	fmt.Printf("[WORKER %d] Ejecutando %s (Op: %s, Intento: %d)\n", *workerPort, task.NodeID, task.Op, task.Attempt)
 	outputFile := fmt.Sprintf("%s/%s_%s.txt", outputDir, task.JobID, task.NodeID)
 	
@@ -96,8 +125,6 @@ func executeTask(task common.Task) {
 	case "reduce_by_key":
 		err = opReduceByKey(task.InputFiles, outputFile, task.Fn)
 	case "join":
-		// Join simplificado: carga archivo A en hash map, recorre archivo B
-		// Asume que inputFiles[0] es Left y inputFiles[1] es Right
 		if len(task.InputFiles) >= 2 {
 			err = opJoin(task.InputFiles[0], task.InputFiles[1], outputFile)
 		} else {
@@ -147,7 +174,8 @@ func opMap(inputs []string, output string, fnName string) error {
 	w := bufio.NewWriter(f)
 
 	for _, in := range inputs {
-		file, _ := os.Open(in)
+		file, _ := os.Open(in) // Ignora error si un input falta (best-effort)
+		if file == nil { continue }
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			w.WriteString(fn(scanner.Text()) + "\n")
@@ -168,6 +196,7 @@ func opFlatMap(inputs []string, output string, fnName string) error {
 
 	for _, in := range inputs {
 		file, _ := os.Open(in)
+		if file == nil { continue }
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			for _, item := range fn(scanner.Text()) {
@@ -190,6 +219,7 @@ func opFilter(inputs []string, output string, fnName string) error {
 
 	for _, in := range inputs {
 		file, _ := os.Open(in)
+		if file == nil { continue }
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -209,7 +239,6 @@ func opReduceByKey(inputs []string, output string, fnName string) error {
 		if err != nil { continue }
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-			// Asume formato simple texto
 			counts[scanner.Text()]++
 		}
 		file.Close()
@@ -224,10 +253,7 @@ func opReduceByKey(inputs []string, output string, fnName string) error {
 	return w.Flush()
 }
 
-// Join simple (Hash Join en memoria)
-// Formato esperado de archivos: "id,valor"
 func opJoin(leftFile, rightFile, output string) error {
-	// 1. Cargar Left en tabla Hash
 	leftMap := make(map[string]string)
 	
 	lFile, err := os.Open(leftFile)
@@ -241,7 +267,6 @@ func opJoin(leftFile, rightFile, output string) error {
 	}
 	lFile.Close()
 
-	// 2. Recorrer Right y cruzar
 	rFile, err := os.Open(rightFile)
 	if err != nil { return err }
 	defer rFile.Close()
@@ -258,7 +283,6 @@ func opJoin(leftFile, rightFile, output string) error {
 			key := parts[0]
 			valRight := parts[1]
 			if valLeft, ok := leftMap[key]; ok {
-				// Join Match!
 				w.WriteString(fmt.Sprintf("%s, %s, %s\n", key, valLeft, valRight))
 			}
 		}
@@ -279,7 +303,6 @@ func reportCompletion(task common.Task, status, resultPath, errorMsg string) {
 	}
 	data, _ := json.Marshal(res)
 	
-	// Reintentos de red
 	for i := 0; i < 3; i++ {
 		resp, err := http.Post(masterURL+"/task/complete", "application/json", bytes.NewBuffer(data))
 		if err == nil {
@@ -294,13 +317,21 @@ func reportCompletion(task common.Task, status, resultPath, errorMsg string) {
 func main() {
 	flag.Parse()
 	id := uuid.New().String()
+	
+	// Iniciar servidor worker
 	go func() {
 		http.HandleFunc("/task", taskHandler)
-		http.ListenAndServe(fmt.Sprintf(":%d", *workerPort), nil)
+		if err := http.ListenAndServe(fmt.Sprintf(":%d", *workerPort), nil); err != nil {
+			log.Fatalf("Fallo al iniciar worker: %v", err)
+		}
 	}()
+
+	// Registro con reintentos
 	for {
 		if registerWorker(id) == nil { break }
 		time.Sleep(2 * time.Second)
 	}
+	
+	// Loop de heartbeats (bloqueante)
 	sendHeartbeat(id)
 }
