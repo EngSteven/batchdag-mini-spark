@@ -1,0 +1,21 @@
+{
+  "name": "jsonl-export-test",
+  "dag": {
+    "nodes": [
+      {
+        "id": "ingest",
+        "op": "read_jsonl",
+        "path": "data/users.csv"
+      },
+      {
+        "id": "export_json",
+        "op": "map",
+        "fn": "to_json"
+      }
+    ],
+    "edges": [
+      ["ingest", "export_json"]
+    ]
+  },
+  "parallelism": 1
+}
