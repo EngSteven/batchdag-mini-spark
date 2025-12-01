@@ -91,6 +91,14 @@ stop:
 	@pkill -9 -x "worker" || true
 	@echo "✅ Procesos detenidos y puertos liberados."
 
+# Ejecutar todas las pruebas (Unitarias, Integración, E2E)
+test:
+	@echo "🧪 Ejecutando suite de pruebas..."
+	@# Aseguramos limpieza previa para que el E2E no choque con procesos vivos
+	@$(MAKE) stop > /dev/null 2>&1 || true
+	@go test -v ./tests/...
+	@echo "✅ Pruebas finalizadas."
+
 # ==========================================
 # 2. ENTORNO DOCKER (Entrega / Demo)
 # ==========================================

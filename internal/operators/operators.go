@@ -92,6 +92,30 @@ func FlatMap(inputs []string, output string, fnName string) error {
 	return w.Flush()
 }
 
+func Filter(inputs []string, output string, fnName string) error {
+	fn, ok := FilterFunctions[fnName]
+	if !ok { return fmt.Errorf("fn filter no encontrada") }
+
+	f, err := os.Create(output)
+	if err != nil { return err }
+	defer f.Close()
+	w := bufio.NewWriter(f)
+
+	for _, in := range inputs {
+		file, _ := os.Open(in)
+		if file == nil { continue }
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if fn(line) {
+				w.WriteString(line + "\n")
+			}
+		}
+		file.Close()
+	}
+	return w.Flush()
+}
+
 func ReduceByKey(inputs []string, output string) error {
 	counts := make(map[string]int)
 	for _, in := range inputs {

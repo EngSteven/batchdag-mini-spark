@@ -5,7 +5,7 @@
       {
         "id": "read_users",
         "op": "read_csv",
-        "path": "data/users.csv"
+        "path": "data/users1.csv"
       },
       {
         "id": "read_orders",
