@@ -1,4 +1,8 @@
 /bin
 /tmp_shared
+/logs
 
 master_state.json
+big_text.csv
+catalog.csv
+sales.csv

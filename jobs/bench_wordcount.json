@@ -1,0 +1,33 @@
+{
+  "name": "benchmark-wordcount-500k",
+  "dag": {
+    "nodes": [
+      {
+        "id": "read",
+        "op": "read_csv",
+        "path": "data/big_text.csv"
+      },
+      {
+        "id": "flat",
+        "op": "flat_map",
+        "fn": "tokenize"
+      },
+      {
+        "id": "map",
+        "op": "map",
+        "fn": "to_lower"
+      },
+      {
+        "id": "count",
+        "op": "reduce_by_key",
+        "fn": "sum"
+      }
+    ],
+    "edges": [
+      ["read", "flat"],
+      ["flat", "map"],
+      ["map", "count"]
+    ]
+  },
+  "parallelism": 4
+}

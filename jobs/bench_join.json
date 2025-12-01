@@ -1,0 +1,27 @@
+{
+  "name": "benchmark-join-sales",
+  "dag": {
+    "nodes": [
+      {
+        "id": "read_catalog",
+        "op": "read_csv",
+        "path": "data/catalog.csv"
+      },
+      {
+        "id": "read_sales",
+        "op": "read_csv",
+        "path": "data/sales.csv"
+      },
+      {
+        "id": "join_products",
+        "op": "join",
+        "fn": "identity"
+      }
+    ],
+    "edges": [
+      ["read_catalog", "join_products"],
+      ["read_sales", "join_products"]
+    ]
+  },
+  "parallelism": 4
+}
