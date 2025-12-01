@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"net"
 
 	"github.com/google/uuid"
 )
@@ -123,11 +124,38 @@ func (m *Master) registerHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	workerURL := fmt.Sprintf("http://localhost:%d", req.Port)
-	m.Workers[req.ID] = &common.WorkerInfo{ID: req.ID, URL: workerURL, LastHeartbeat: time.Now(), Status: "UP"}
-	logJSON("INFO", "Worker registrado", map[string]interface{}{"worker_id": req.ID})
+
+	// DETECCIÓN INTELIGENTE DE IP
+	// Obtenemos la IP de origen de la petición HTTP
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// Fallback si no se puede parsear (ej: tests locales raros)
+		host = "localhost"
+	}
+	
+	// Si es local, preferimos "localhost" para evitar problemas de DNS raros en WSL
+	if host == "::1" || host == "127.0.0.1" {
+		host = "localhost"
+	}
+
+	// Construimos la URL real usando la IP detectada y el puerto reportado
+	workerURL := fmt.Sprintf("http://%s:%d", host, req.Port)
+
+	m.Workers[req.ID] = &common.WorkerInfo{
+		ID:            req.ID,
+		URL:           workerURL,
+		LastHeartbeat: time.Now(),
+		Status:        "UP",
+	}
+
+	logJSON("INFO", "Worker registrado", map[string]interface{}{
+		"worker_id": req.ID, 
+		"ip_detected": host,
+		"url": workerURL,
+	})
 	w.WriteHeader(http.StatusOK)
 }
 

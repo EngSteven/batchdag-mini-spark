@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  master:
+    build: .
+    command: master
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data             # Datos de entrada
+      - ./tmp_shared:/tmp/mini-spark # Simulación de DFS compartido
+    networks:
+      - spark-net
+
+  worker-1:
+    build: .
+    command: worker -port 9001
+    depends_on:
+      - master
+    environment:
+      - MASTER_URL=http://master:8080
+    volumes:
+      - ./data:/app/data
+      - ./tmp_shared:/tmp/mini-spark
+    networks:
+      - spark-net
+
+  worker-2:
+    build: .
+    command: worker -port 9002
+    depends_on:
+      - master
+    environment:
+      - MASTER_URL=http://master:8080
+    volumes:
+      - ./data:/app/data
+      - ./tmp_shared:/tmp/mini-spark
+    networks:
+      - spark-net
+
+# Volumen para simular DFS (opcional si usas bind mounts locales como arriba)
+volumes:
+  shared_data:
+
+networks:
+  spark-net:
