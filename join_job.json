@@ -1,0 +1,27 @@
+{
+  "name": "join-test",
+  "dag": {
+    "nodes": [
+      {
+        "id": "read_users",
+        "op": "read_csv",
+        "path": "data/users.csv"
+      },
+      {
+        "id": "read_orders",
+        "op": "read_csv",
+        "path": "data/purchases.csv"
+      },
+      {
+        "id": "join_data",
+        "op": "join",
+        "fn": "identity" 
+      }
+    ],
+    "edges": [
+      ["read_users", "join_data"],
+      ["read_orders", "join_data"]
+    ]
+  },
+  "parallelism": 2
+}

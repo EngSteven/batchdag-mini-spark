@@ -18,37 +18,36 @@ import (
 var (
 	masterURL  = "http://localhost:8080"
 	workerPort = flag.Int("port", 9001, "Puerto del worker")
-	outputDir  = "/tmp/mini-spark" // Directorio compartido simulado
+	outputDir  = "/tmp/mini-spark"
 )
 
-// --- REGISTRO DE FUNCIONES (UDFs) ---
-// En un sistema real (Spark/Flink), el usuario envía el código serializado.
-// Aquí hardcodeamos las funciones soportadas.
+// --- UDFs (Funciones de Usuario) ---
 
 var mapFunctions = map[string]func(string) string{
 	"to_lower": func(s string) string { return strings.ToLower(s) },
-	"identity": func(s string) string { return s },
+}
+
+var filterFunctions = map[string]func(string) bool{
+	"long_words": func(s string) bool { return len(s) > 4 }, // Ejemplo: filtrar palabras cortas
 }
 
 var flatMapFunctions = map[string]func(string) []string{
 	"tokenize": func(s string) []string {
-		// Normalizar y separar por espacios
 		s = strings.Map(func(r rune) rune {
-			if strings.ContainsRune(".,;?!-", r) {
-				return -1 // Eliminar puntuación básica
-			}
+			if strings.ContainsRune(".,;?!-", r) { return -1 }
 			return r
 		}, s)
 		return strings.Fields(s)
 	},
 }
 
-// --- INFRAESTRUCTURA ---
+// --- INIT ---
 
 func init() {
-	// Asegurar que existe el directorio temporal
 	os.MkdirAll(outputDir, 0755)
 }
+
+// --- NETWORKING ---
 
 func registerWorker(id string) error {
 	req := common.RegisterRequest{ID: id, Port: *workerPort}
@@ -78,190 +77,227 @@ func taskHandler(w http.ResponseWriter, r *http.Request) {
 	go executeTask(task)
 }
 
-// --- MOTOR DE EJECUCIÓN ---
+// --- EJECUCIÓN PRINCIPAL ---
 
 func executeTask(task common.Task) {
-	fmt.Printf("[WORKER %d] Ejecutando %s (Op: %s)...\n", *workerPort, task.NodeID, task.Op)
-
-	// Definir archivo de salida
+	fmt.Printf("[WORKER %d] Ejecutando %s (Op: %s, Intento: %d)\n", *workerPort, task.NodeID, task.Op, task.Attempt)
 	outputFile := fmt.Sprintf("%s/%s_%s.txt", outputDir, task.JobID, task.NodeID)
 	
 	var err error
-	
-	// Switch de Operadores
 	switch task.Op {
 	case "read_csv":
-		// En Batch DAG, read_csv lee un archivo origen y escribe en formato interno
 		err = opReadCSV(task.Args[0], outputFile)
 	case "map":
 		err = opMap(task.InputFiles, outputFile, task.Fn)
 	case "flat_map":
 		err = opFlatMap(task.InputFiles, outputFile, task.Fn)
+	case "filter":
+		err = opFilter(task.InputFiles, outputFile, task.Fn)
 	case "reduce_by_key":
-		// Dejaremos esto como "dummy" por ahora, solo copia datos para no romper el flujo
 		err = opReduceByKey(task.InputFiles, outputFile, task.Fn)
+	case "join":
+		// Join simplificado: carga archivo A en hash map, recorre archivo B
+		// Asume que inputFiles[0] es Left y inputFiles[1] es Right
+		if len(task.InputFiles) >= 2 {
+			err = opJoin(task.InputFiles[0], task.InputFiles[1], outputFile)
+		} else {
+			err = fmt.Errorf("join requiere al menos 2 inputs")
+		}
 	default:
-		err = fmt.Errorf("operación no soportada: %s", task.Op)
+		err = fmt.Errorf("operación desconocida: %s", task.Op)
 	}
 
 	status := "COMPLETED"
+	errorMsg := ""
 	if err != nil {
-		fmt.Printf("[WORKER %d] Error en tarea %s: %v\n", *workerPort, task.NodeID, err)
+		fmt.Printf("[WORKER %d] ERROR en %s: %v\n", *workerPort, task.NodeID, err)
 		status = "FAILED"
+		errorMsg = err.Error()
 	} else {
-		fmt.Printf("[WORKER %d] Tarea %s completada. Output: %s\n", *workerPort, task.NodeID, outputFile)
+		fmt.Printf("[WORKER %d] Completado %s\n", *workerPort, task.NodeID)
 	}
 
-	reportCompletion(task, status, outputFile)
+	reportCompletion(task, status, outputFile, errorMsg)
 }
 
 // --- OPERADORES ---
 
-func opReadCSV(inputPath string, outputPath string) error {
-	// Leer archivo fuente
+func opReadCSV(inputPath, outputPath string) error {
 	inFile, err := os.Open(inputPath)
 	if err != nil { return err }
 	defer inFile.Close()
-
-	// Crear archivo salida
 	outFile, err := os.Create(outputPath)
 	if err != nil { return err }
 	defer outFile.Close()
-
 	scanner := bufio.NewScanner(inFile)
 	writer := bufio.NewWriter(outFile)
-
 	for scanner.Scan() {
-		line := scanner.Text()
-		// Aquí podríamos parsear CSV, pero por simplicidad pasamos la línea cruda
-		writer.WriteString(line + "\n")
+		writer.WriteString(scanner.Text() + "\n")
 	}
 	return writer.Flush()
 }
 
-func opMap(inputFiles []string, outputPath string, fnName string) error {
+func opMap(inputs []string, output string, fnName string) error {
 	fn, ok := mapFunctions[fnName]
-	if !ok { return fmt.Errorf("función map no encontrada: %s", fnName) }
-
-	outFile, err := os.Create(outputPath)
+	if !ok { return fmt.Errorf("fn map no encontrada") }
+	
+	f, err := os.Create(output)
 	if err != nil { return err }
-	defer outFile.Close()
-	writer := bufio.NewWriter(outFile)
+	defer f.Close()
+	w := bufio.NewWriter(f)
 
-	for _, inputFile := range inputFiles {
-		inFile, err := os.Open(inputFile)
-		if err != nil { continue } // Si falla un input, seguimos (naive)
-		
-		scanner := bufio.NewScanner(inFile)
-		for scanner.Scan() {
-			res := fn(scanner.Text())
-			writer.WriteString(res + "\n")
-		}
-		inFile.Close()
-	}
-	return writer.Flush()
-}
-
-func opFlatMap(inputFiles []string, outputPath string, fnName string) error {
-	fn, ok := flatMapFunctions[fnName]
-	if !ok { return fmt.Errorf("función flat_map no encontrada: %s", fnName) }
-
-	outFile, err := os.Create(outputPath)
-	if err != nil { return err }
-	defer outFile.Close()
-	writer := bufio.NewWriter(outFile)
-
-	for _, inputFile := range inputFiles {
-		inFile, err := os.Open(inputFile)
-		if err != nil { continue }
-		
-		scanner := bufio.NewScanner(inFile)
-		for scanner.Scan() {
-			results := fn(scanner.Text()) // Retorna array de strings
-			for _, item := range results {
-				writer.WriteString(item + "\n")
-			}
-		}
-		inFile.Close()
-	}
-	return writer.Flush()
-}
-
-func opDummy(inputFiles []string, outputPath string) error {
-    // Simula éxito creando un archivo vacío o copiando
-    f, err := os.Create(outputPath)
-    if err != nil { return err }
-    f.WriteString("resultado_simulado\n")
-    f.Close()
-    return nil
-}
-
-func opReduceByKey(inputFiles []string, outputPath string, fnName string) error {
-	// 1. Estructura para agregación en memoria (Key -> Value)
-	// En un caso real, esto debería hacer "spill to disk" si la memoria se llena.
-	counts := make(map[string]int)
-
-	fmt.Printf("   -> Iniciando Reduce sobre %d archivos de entrada\n", len(inputFiles))
-
-	// 2. Leer TODOS los archivos de entrada (Shuffle Read)
-	for _, inputFile := range inputFiles {
-		file, err := os.Open(inputFile)
-		if err != nil {
-			fmt.Printf("   -> Error leyendo input %s: %v\n", inputFile, err)
-			continue
-		}
-
+	for _, in := range inputs {
+		file, _ := os.Open(in)
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-			key := scanner.Text()
-			// En WordCount, cada línea es una ocurrencia (valor 1)
-			if fnName == "sum" {
-				counts[key]++
+			w.WriteString(fn(scanner.Text()) + "\n")
+		}
+		file.Close()
+	}
+	return w.Flush()
+}
+
+func opFlatMap(inputs []string, output string, fnName string) error {
+	fn, ok := flatMapFunctions[fnName]
+	if !ok { return fmt.Errorf("fn flat_map no encontrada") }
+
+	f, err := os.Create(output)
+	if err != nil { return err }
+	defer f.Close()
+	w := bufio.NewWriter(f)
+
+	for _, in := range inputs {
+		file, _ := os.Open(in)
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			for _, item := range fn(scanner.Text()) {
+				w.WriteString(item + "\n")
 			}
 		}
 		file.Close()
 	}
+	return w.Flush()
+}
 
-	// 3. Escribir resultados finales
-	outFile, err := os.Create(outputPath)
-	if err != nil {
-		return err
+func opFilter(inputs []string, output string, fnName string) error {
+	fn, ok := filterFunctions[fnName]
+	if !ok { return fmt.Errorf("fn filter no encontrada") }
+
+	f, err := os.Create(output)
+	if err != nil { return err }
+	defer f.Close()
+	w := bufio.NewWriter(f)
+
+	for _, in := range inputs {
+		file, _ := os.Open(in)
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if fn(line) {
+				w.WriteString(line + "\n")
+			}
+		}
+		file.Close()
 	}
+	return w.Flush()
+}
+
+func opReduceByKey(inputs []string, output string, fnName string) error {
+	counts := make(map[string]int)
+	for _, in := range inputs {
+		file, err := os.Open(in)
+		if err != nil { continue }
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			// Asume formato simple texto
+			counts[scanner.Text()]++
+		}
+		file.Close()
+	}
+	f, err := os.Create(output)
+	if err != nil { return err }
+	defer f.Close()
+	w := bufio.NewWriter(f)
+	for k, v := range counts {
+		w.WriteString(fmt.Sprintf("%s, %d\n", k, v))
+	}
+	return w.Flush()
+}
+
+// Join simple (Hash Join en memoria)
+// Formato esperado de archivos: "id,valor"
+func opJoin(leftFile, rightFile, output string) error {
+	// 1. Cargar Left en tabla Hash
+	leftMap := make(map[string]string)
+	
+	lFile, err := os.Open(leftFile)
+	if err != nil { return err }
+	lScanner := bufio.NewScanner(lFile)
+	for lScanner.Scan() {
+		parts := strings.SplitN(lScanner.Text(), ",", 2)
+		if len(parts) == 2 {
+			leftMap[parts[0]] = parts[1]
+		}
+	}
+	lFile.Close()
+
+	// 2. Recorrer Right y cruzar
+	rFile, err := os.Open(rightFile)
+	if err != nil { return err }
+	defer rFile.Close()
+	
+	outFile, err := os.Create(output)
+	if err != nil { return err }
 	defer outFile.Close()
-	writer := bufio.NewWriter(outFile)
+	w := bufio.NewWriter(outFile)
 
-	for key, count := range counts {
-		// Formato de salida: "palabra, cantidad"
-		line := fmt.Sprintf("%s, %d\n", key, count)
-		writer.WriteString(line)
+	rScanner := bufio.NewScanner(rFile)
+	for rScanner.Scan() {
+		parts := strings.SplitN(rScanner.Text(), ",", 2)
+		if len(parts) == 2 {
+			key := parts[0]
+			valRight := parts[1]
+			if valLeft, ok := leftMap[key]; ok {
+				// Join Match!
+				w.WriteString(fmt.Sprintf("%s, %s, %s\n", key, valLeft, valRight))
+			}
+		}
 	}
-
-	return writer.Flush()
+	return w.Flush()
 }
 
 // --- REPORTE ---
 
-func reportCompletion(task common.Task, status, resultPath string) {
+func reportCompletion(task common.Task, status, resultPath, errorMsg string) {
 	res := common.TaskResult{
-		ID:     task.ID,
-		JobID:  task.JobID,
-		NodeID: task.NodeID,
-		Status: status,
-		Result: resultPath,
+		ID:       task.ID,
+		JobID:    task.JobID,
+		NodeID:   task.NodeID,
+		Status:   status,
+		Result:   resultPath,
+		ErrorMsg: errorMsg,
 	}
 	data, _ := json.Marshal(res)
-	http.Post(masterURL+"/task/complete", "application/json", bytes.NewBuffer(data))
+	
+	// Reintentos de red
+	for i := 0; i < 3; i++ {
+		resp, err := http.Post(masterURL+"/task/complete", "application/json", bytes.NewBuffer(data))
+		if err == nil {
+			resp.Body.Close()
+			return
+		}
+		time.Sleep(1 * time.Second)
+	}
+	fmt.Printf("[WORKER %d] ERROR REPORTANDO ESTADO\n", *workerPort)
 }
 
 func main() {
 	flag.Parse()
 	id := uuid.New().String()
-	
 	go func() {
 		http.HandleFunc("/task", taskHandler)
 		http.ListenAndServe(fmt.Sprintf(":%d", *workerPort), nil)
 	}()
-
 	for {
 		if registerWorker(id) == nil { break }
 		time.Sleep(2 * time.Second)

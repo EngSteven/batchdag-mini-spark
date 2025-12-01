@@ -7,28 +7,32 @@ import (
 	"log"
 	"mini-spark/internal/common"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// Estado global del Master
 type Master struct {
 	Workers map[string]*common.WorkerInfo
 	Jobs    map[string]*common.Job
 
-	// Mapa de progreso: JobID -> NodeID -> Estatus ("PENDING", "SCHEDULED", "COMPLETED")
-	JobProgress map[string]map[string]string
-	JobOutputs map[string]map[string]string
+	// Estado de ejecución
+	JobProgress map[string]map[string]string // JobID -> NodeID -> Status
+	JobOutputs  map[string]map[string]string // JobID -> NodeID -> OutputPath
 
-	TaskQueue  chan common.Task // Canal para tareas pendientes
-	WorkerKeys []string         // Lista auxiliar para Round-Robin eficiente
-	rrIndex    int              // Índice actual para Round-Robin
+	// Tolerancia a fallos
+	TaskQueue       chan common.Task
+	TaskAssignments map[string]string      // TaskID -> WorkerID (Quién la tiene asignada)
+	RunningTasks    map[string]common.Task // TaskID -> Task (Copia de la tarea para re-encolar)
+
+	WorkerKeys []string
+	rrIndex    int
 	mu         sync.Mutex
 }
 
-// --- HANDLERS DE REGISTRO Y HEARTBEAT ---
+// --- HANDLERS BÁSICOS ---
 
 func (m *Master) registerHandler(w http.ResponseWriter, r *http.Request) {
 	var req common.RegisterRequest
@@ -47,40 +51,29 @@ func (m *Master) registerHandler(w http.ResponseWriter, r *http.Request) {
 		LastHeartbeat: time.Now(),
 		Status:        "UP",
 	}
-
-	fmt.Printf("[MASTER] Worker registrado: %s en %s\n", req.ID, workerURL)
+	fmt.Printf("[MASTER] Worker registrado: %s\n", req.ID)
 	w.WriteHeader(http.StatusOK)
 }
 
 func (m *Master) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
 	var req common.HeartbeatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if worker, exists := m.Workers[req.ID]; exists {
 		worker.LastHeartbeat = time.Now()
 		worker.Status = "UP"
-	} else {
-		// fmt.Printf("[MASTER] Heartbeat de worker desconocido: %s\n", req.ID)
-		w.WriteHeader(http.StatusNotFound)
-		return
 	}
+	m.mu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
 
-// --- HANDLERS DE TRABAJO (JOBS & TASKS) ---
+// --- GESTIÓN DE JOBS ---
 
 func (m *Master) submitJobHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
-		return
-	}
-
 	var req common.JobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "JSON inválido", http.StatusBadRequest)
@@ -91,27 +84,151 @@ func (m *Master) submitJobHandler(w http.ResponseWriter, r *http.Request) {
 	job := &common.Job{
 		ID:        jobID,
 		Name:      req.Name,
-		Status:    "ACCEPTED",
+		Status:    "RUNNING",
 		Graph:     req.DAG,
 		Submitted: time.Now(),
 	}
 
 	m.mu.Lock()
 	m.Jobs[jobID] = job
-	m.initJobProgress(job) // Inicializar estados en PENDING
+	m.initJobProgress(job)
 	m.mu.Unlock()
 
-	fmt.Printf("[MASTER] Job recibido: %s (ID: %s)\n", req.Name, jobID)
-
-	// Iniciar planificación de las tareas fuente (sin dependencias)
+	fmt.Printf("[MASTER] Job recibido: %s (%s)\n", req.Name, jobID)
 	go m.scheduleSourceTasks(job)
 
-	// Responder con el ID del job
+	json.NewEncoder(w).Encode(map[string]string{"job_id": jobID, "status": "ACCEPTED"})
+}
+
+func (m *Master) getJobStatusHandler(w http.ResponseWriter, r *http.Request) {
+	// Extraer ID de la URL: /api/v1/jobs/{id}
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 5 {
+		http.Error(w, "ID no encontrado", http.StatusBadRequest)
+		return
+	}
+	jobID := parts[4]
+
+	m.mu.Lock()
+	job, exists := m.Jobs[jobID]
+	progress := make(map[string]string)
+	if p, ok := m.JobProgress[jobID]; ok {
+		// Copiar mapa para evitar condiciones de carrera al codificar JSON
+		for k, v := range p {
+			progress[k] = v
+		}
+	}
+	m.mu.Unlock()
+
+	if !exists {
+		http.Error(w, "Job no encontrado", http.StatusNotFound)
+		return
+	}
+
+	duration := time.Since(job.Submitted).Seconds()
+	if job.Status == "COMPLETED" || job.Status == "FAILED" {
+		duration = job.Completed.Sub(job.Submitted).Seconds()
+	}
+
+	resp := common.JobStatusResponse{
+		ID:           job.ID,
+		Name:         job.Name,
+		Status:       job.Status,
+		Submitted:    job.Submitted,
+		DurationSecs: duration,
+		Progress:     progress,
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"job_id": jobID,
-		"status": "ACCEPTED",
-	})
+	json.NewEncoder(w).Encode(resp)
+}
+
+// --- PLANIFICADOR Y TOLERANCIA A FALLOS ---
+
+func (m *Master) scheduleSourceTasks(job *common.Job) {
+	inDegree := make(map[string]int)
+	for _, node := range job.Graph.Nodes {
+		inDegree[node.ID] = 0
+	}
+	for _, edge := range job.Graph.Edges {
+		inDegree[edge[1]]++
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, node := range job.Graph.Nodes {
+		if inDegree[node.ID] == 0 {
+			m.queueTask(job.ID, node, []string{})
+		}
+	}
+}
+
+// Helper para crear y encolar tarea
+func (m *Master) queueTask(jobID string, node common.DAGNode, inputs []string) {
+	m.setNodeStatus(jobID, node.ID, "SCHEDULED")
+	
+	task := common.Task{
+		ID:         uuid.New().String(),
+		JobID:      jobID,
+		NodeID:     node.ID,
+		Op:         node.Op,
+		Fn:         node.Fn,
+		Args:       []string{node.Path},
+		InputFiles: inputs,
+		Attempt:    1,
+	}
+	m.TaskQueue <- task
+	fmt.Printf("[MASTER] Tarea encolada: %s (Node: %s)\n", task.ID, node.ID)
+}
+
+func (m *Master) schedulerLoop() {
+	for task := range m.TaskQueue {
+		m.mu.Lock()
+		
+		// Filtrar workers UP
+		var availableWorkers []*common.WorkerInfo
+		for _, w := range m.Workers {
+			if w.Status == "UP" {
+				availableWorkers = append(availableWorkers, w)
+			}
+		}
+
+		if len(availableWorkers) == 0 {
+			m.mu.Unlock()
+			fmt.Println("[MASTER] Esperando workers...")
+			time.Sleep(2 * time.Second)
+			m.TaskQueue <- task
+			continue
+		}
+
+		worker := availableWorkers[m.rrIndex%len(availableWorkers)]
+		m.rrIndex++
+		
+		// REGISTRAR ASIGNACIÓN (CRÍTICO PARA TOLERANCIA A FALLOS)
+		m.TaskAssignments[task.ID] = worker.ID
+		m.RunningTasks[task.ID] = task
+		
+		m.mu.Unlock()
+
+		go m.sendTask(worker, task)
+	}
+}
+
+func (m *Master) sendTask(worker *common.WorkerInfo, task common.Task) {
+	data, _ := json.Marshal(task)
+	resp, err := http.Post(worker.URL+"/task", "application/json", bytes.NewBuffer(data))
+	
+	if err != nil {
+		fmt.Printf("[MASTER] Error enviando a %s. Reencolando...\n", worker.ID)
+		m.mu.Lock()
+		delete(m.TaskAssignments, task.ID) // Limpiar asignación fallida
+		// No borramos de RunningTasks porque se va a re-encolar
+		m.mu.Unlock()
+		m.TaskQueue <- task
+		return
+	}
+	defer resp.Body.Close()
 }
 
 func (m *Master) completeTaskHandler(w http.ResponseWriter, r *http.Request) {
@@ -124,175 +241,138 @@ func (m *Master) completeTaskHandler(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// 1. Marcar nodo como completado usando el helper
-	// Esto corrige el error de tipos (bool vs string)
-	m.setNodeStatus(res.JobID, res.NodeID, "COMPLETED")
-	fmt.Printf("[MASTER] Tarea completada: %s (Node: %s)\n", res.ID, res.NodeID)
+	// Limpiar tracking de ejecución
+	delete(m.TaskAssignments, res.ID)
+	originalTask, taskFound := m.RunningTasks[res.ID]
+	delete(m.RunningTasks, res.ID)
 
-	// 2. Verificar dependencias y planificar siguientes tareas
-	job, exists := m.Jobs[res.JobID]
-	if !exists {
+	// MANEJO DE FALLOS Y REINTENTOS
+	if res.Status == "FAILED" {
+		fmt.Printf("[MASTER] Tarea %s FALLÓ (Error: %s)\n", res.NodeID, res.ErrorMsg)
+		
+		if taskFound && originalTask.Attempt < common.MaxRetries {
+			originalTask.Attempt++
+			originalTask.ID = uuid.New().String() // Nuevo ID de tarea para el reintento
+			fmt.Printf("[MASTER] Reintentando tarea %s (Intento %d/%d)\n", res.NodeID, originalTask.Attempt, common.MaxRetries)
+			
+			// Re-encolar (necesitamos liberar lock antes de enviar a channel si fuera blocking, pero TaskQueue tiene buffer)
+			// Para seguridad, lo hacemos en goroutine o aseguramos buffer. 
+			// Aquí asumimos buffer suficiente o enviamos a goroutine.
+			go func(t common.Task) { m.TaskQueue <- t }(originalTask)
+		} else {
+			fmt.Printf("[MASTER] Tarea %s excedió reintentos. Job FAILED.\n", res.NodeID)
+			if job, ok := m.Jobs[res.JobID]; ok {
+				job.Status = "FAILED"
+				job.Completed = time.Now()
+			}
+		}
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Guardar el output de la tarea
+	// ÉXITO
+	m.setNodeStatus(res.JobID, res.NodeID, "COMPLETED")
+	
 	if _, ok := m.JobOutputs[res.JobID]; !ok {
-			m.JobOutputs[res.JobID] = make(map[string]string)
+		m.JobOutputs[res.JobID] = make(map[string]string)
 	}
 	m.JobOutputs[res.JobID][res.NodeID] = res.Result
+	
+	fmt.Printf("[MASTER] Tarea completada: %s\n", res.NodeID)
 
-	// Luego marcar como COMPLETED y llamar a dependencias...
-	m.setNodeStatus(res.JobID, res.NodeID, "COMPLETED")
-
-	m.checkAndScheduleDependents(job)
-
+	// Verificar dependencias
+	if job, ok := m.Jobs[res.JobID]; ok {
+		m.checkAndScheduleDependents(job)
+		m.checkJobCompletion(job)
+	}
 	w.WriteHeader(http.StatusOK)
 }
 
-// --- LÓGICA DEL PLANIFICADOR (SCHEDULER) ---
-
-// Encuentra nodos que no tienen dependencias y crea tareas
-func (m *Master) scheduleSourceTasks(job *common.Job) {
-	// Calcular indegree
-	inDegree := make(map[string]int)
-	for _, node := range job.Graph.Nodes {
-		inDegree[node.ID] = 0
-	}
-	for _, edge := range job.Graph.Edges {
-		dest := edge[1]
-		inDegree[dest]++
-	}
-
-	// Como esta funcion se llama desde una goroutine aparte, necesitamos lockear
-	// para modificar el estado a SCHEDULED safely
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, node := range job.Graph.Nodes {
-		if inDegree[node.ID] == 0 {
-			m.setNodeStatus(job.ID, node.ID, "SCHEDULED")
-
-			task := common.Task{
-				ID:        uuid.New().String(),
-				JobID:     job.ID,
-				NodeID:    node.ID,
-				Op:        node.Op,
-				Fn:        node.Fn,
-				Args:      []string{node.Path},
-				Partition: 0,
-			}
-			fmt.Printf("[MASTER] Planificando tarea fuente: %s (Node: %s)\n", task.ID, node.ID)
-			m.TaskQueue <- task
-		}
-	}
-}
-
-// Revisa si los hijos de las tareas completadas ya pueden ejecutarse
 func (m *Master) checkAndScheduleDependents(job *common.Job) {
-	// NOTA: Se asume que m.mu ya está bloqueado por quien llama a esta función (completeTaskHandler)
-
+	// (Lógica similar a la anterior, optimizada)
 	for _, node := range job.Graph.Nodes {
-		// Si ya está agendada o completa, saltar
 		status := m.getNodeStatus(job.ID, node.ID)
-		if status == "COMPLETED" || status == "SCHEDULED" {
-			continue
-		}
+		if status != "PENDING" { continue }
 
-		// Verificar padres
 		allParentsDone := true
 		hasParents := false
+		var inputFiles []string
 
 		for _, edge := range job.Graph.Edges {
-			source, dest := edge[0], edge[1]
-			if dest == node.ID {
+			if edge[1] == node.ID {
 				hasParents = true
-				parentStatus := m.getNodeStatus(job.ID, source)
-				if parentStatus != "COMPLETED" {
+				if m.getNodeStatus(job.ID, edge[0]) != "COMPLETED" {
 					allParentsDone = false
 					break
 				}
+				inputFiles = append(inputFiles, m.JobOutputs[job.ID][edge[0]])
 			}
 		}
 
-		// Si tiene padres y todos terminaron, agendar
 		if hasParents && allParentsDone {
-			m.setNodeStatus(job.ID, node.ID, "SCHEDULED")
-
-			// RECOLECTAR INPUTS DE LOS PADRES
-			var inputFiles []string
-			for _, edge := range job.Graph.Edges {
-					source, dest := edge[0], edge[1]
-					if dest == node.ID {
-							// Buscar el archivo que generó el padre
-							if path, ok := m.JobOutputs[job.ID][source]; ok {
-									inputFiles = append(inputFiles, path)
-							}
-					}
-			}
-
-			task := common.Task{
-				ID:     uuid.New().String(),
-				JobID:  job.ID,
-				NodeID: node.ID,
-				Op:     node.Op,
-				Fn:     node.Fn,
-				InputFiles: inputFiles,
-			}
-			fmt.Printf("[MASTER] Dependencias satisfechas -> Encolando: %s (Inputs: %v)\n", node.ID, inputFiles)		
-			m.TaskQueue <- task
+			m.queueTask(job.ID, node, inputFiles)
 		}
 	}
 }
 
-// Bucle principal: saca tareas de la cola y las manda a workers
-func (m *Master) schedulerLoop() {
-	for task := range m.TaskQueue {
+func (m *Master) checkJobCompletion(job *common.Job) {
+	allDone := true
+	for _, node := range job.Graph.Nodes {
+		if m.getNodeStatus(job.ID, node.ID) != "COMPLETED" {
+			allDone = false
+			break
+		}
+	}
+	if allDone {
+		fmt.Printf("[MASTER] JOB %s COMPLETADO EXITOSAMENTE!\n", job.ID)
+		job.Status = "COMPLETED"
+		job.Completed = time.Now()
+	}
+}
+
+// --- MONITOR DE SALUD (Heartbeats & Recovery) ---
+
+func (m *Master) healthCheckLoop() {
+	for {
+		time.Sleep(5 * time.Second)
 		m.mu.Lock()
-
-		// 1. Filtrar workers UP
-		var availableWorkers []*common.WorkerInfo
-		for _, w := range m.Workers {
-			if w.Status == "UP" {
-				availableWorkers = append(availableWorkers, w)
+		now := time.Now()
+		
+		for wID, w := range m.Workers {
+			if w.Status == "UP" && now.Sub(w.LastHeartbeat) > 10*time.Second {
+				fmt.Printf("[MASTER] ALERTA: Worker %s murió. Iniciando recuperación...\n", wID)
+				w.Status = "DOWN"
+				
+				// RECUPERACIÓN: Buscar tareas asignadas a este worker muerto
+				for tID, workerAssigned := range m.TaskAssignments {
+					if workerAssigned == wID {
+						if task, ok := m.RunningTasks[tID]; ok {
+							fmt.Printf("[MASTER] Re-planificando tarea %s (víctima de worker caído)\n", task.NodeID)
+							// Eliminar asignación vieja
+							delete(m.TaskAssignments, tID)
+							// Generar nuevo ID para evitar colisiones lógicas
+							task.ID = uuid.New().String() 
+							delete(m.RunningTasks, tID) // Borrar vieja
+							
+							// Re-encolar en background
+							go func(t common.Task) { m.TaskQueue <- t }(task)
+						}
+					}
+				}
 			}
 		}
-
-		if len(availableWorkers) == 0 {
-			m.mu.Unlock()
-			fmt.Println("[MASTER] No hay workers. Esperando...")
-			time.Sleep(2 * time.Second)
-			m.TaskQueue <- task // Reencolar
-			continue
-		}
-
-		// 2. Round-Robin
-		worker := availableWorkers[m.rrIndex%len(availableWorkers)]
-		m.rrIndex++
 		m.mu.Unlock()
-
-		// 3. Enviar (en goroutine para no bloquear el loop)
-		go m.sendTask(worker, task)
 	}
 }
 
-func (m *Master) sendTask(worker *common.WorkerInfo, task common.Task) {
-	data, _ := json.Marshal(task)
-	resp, err := http.Post(worker.URL+"/task", "application/json", bytes.NewBuffer(data))
-
-	if err != nil {
-		fmt.Printf("[MASTER] Error enviando a %s: %v\n", worker.ID, err)
-		// Aquí deberíamos reencolar la tarea en caso de fallo real
-		return
-	}
-	defer resp.Body.Close()
-	// fmt.Printf("[MASTER] Tarea enviada a %s\n", worker.ID)
-}
-
-// --- HELPERS DE ESTADO Y MONITOR ---
+// --- HELPERS ---
 
 func (m *Master) initJobProgress(job *common.Job) {
 	if _, ok := m.JobProgress[job.ID]; !ok {
 		m.JobProgress[job.ID] = make(map[string]string)
+	}
+	if _, ok := m.JobOutputs[job.ID]; !ok {
+		m.JobOutputs[job.ID] = make(map[string]string)
 	}
 	for _, node := range job.Graph.Nodes {
 		m.JobProgress[job.ID][node.ID] = "PENDING"
@@ -300,10 +380,8 @@ func (m *Master) initJobProgress(job *common.Job) {
 }
 
 func (m *Master) getNodeStatus(jobID, nodeID string) string {
-	if states, ok := m.JobProgress[jobID]; ok {
-		if status, ok := states[nodeID]; ok {
-			return status
-		}
+	if s, ok := m.JobProgress[jobID]; ok {
+		return s[nodeID]
 	}
 	return "PENDING"
 }
@@ -315,42 +393,26 @@ func (m *Master) setNodeStatus(jobID, nodeID, status string) {
 	m.JobProgress[jobID][nodeID] = status
 }
 
-func (m *Master) healthCheckLoop() {
-	for {
-		time.Sleep(5 * time.Second)
-		m.mu.Lock()
-		now := time.Now()
-		for id, w := range m.Workers {
-			if now.Sub(w.LastHeartbeat) > 10*time.Second {
-				if w.Status == "UP" {
-					fmt.Printf("[MASTER] ALERTA: Worker %s marcado como DOWN\n", id)
-					w.Status = "DOWN"
-				}
-			}
-		}
-		m.mu.Unlock()
-	}
-}
-
 func main() {
 	master := &Master{
-		Workers:     make(map[string]*common.WorkerInfo),
-		Jobs:        make(map[string]*common.Job),
-		JobProgress: make(map[string]map[string]string), // Inicializado correctamente
-		JobOutputs: make(map[string]map[string]string),
-		TaskQueue:   make(chan common.Task, 100),
+		Workers:         make(map[string]*common.WorkerInfo),
+		Jobs:            make(map[string]*common.Job),
+		JobProgress:     make(map[string]map[string]string),
+		JobOutputs:      make(map[string]map[string]string),
+		TaskQueue:       make(chan common.Task, 100),
+		TaskAssignments: make(map[string]string),
+		RunningTasks:    make(map[string]common.Task),
 	}
 
-	// Endpoints
 	http.HandleFunc("/register", master.registerHandler)
 	http.HandleFunc("/heartbeat", master.heartbeatHandler)
 	http.HandleFunc("/api/v1/jobs", master.submitJobHandler)
+	http.HandleFunc("/api/v1/jobs/", master.getJobStatusHandler) // endpoint con ID
 	http.HandleFunc("/task/complete", master.completeTaskHandler)
 
-	// Loops en background
 	go master.healthCheckLoop()
 	go master.schedulerLoop()
 
-	fmt.Println("[MASTER] Escuchando en puerto 8080...")
+	fmt.Println("[MASTER] Mini-Spark Master v1.0 listo en puerto 8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

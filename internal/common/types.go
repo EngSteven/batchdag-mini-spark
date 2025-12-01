@@ -2,6 +2,11 @@ package common
 
 import "time"
 
+const (
+	MaxRetries = 3
+)
+
+
 // WorkerInfo representa un nodo trabajador registrado en el Master
 type WorkerInfo struct {
 	ID        string    `json:"id"`
@@ -54,6 +59,7 @@ type Job struct {
 	Status    string      `json:"status"` // "ACCEPTED", "RUNNING", "COMPLETED", "FAILED"
 	Graph     DAG         `json:"dag"`
 	Submitted time.Time   `json:"submitted_at"`
+	Completed time.Time   `json:"completed_at,omitempty"`
 }
 
 
@@ -67,6 +73,7 @@ type Task struct {
 	Args      []string `json:"args"`    // Argumentos extra (ej: path archivo)
 	InputFiles []string `json:"input_files"`
 	Partition int      `json:"partition"`
+	Attempt    int      `json:"attempt"`
 }
 
 // TaskResult reporte del worker al master
@@ -76,4 +83,15 @@ type TaskResult struct {
 	NodeID    string `json:"node_id"`
 	Status    string `json:"status"`    // "COMPLETED", "FAILED"
 	Result    string `json:"result"`    // (Opcional) Path de salida o mensaje
+	ErrorMsg  string `json:"error_msg,omitempty"`
+}
+
+// JobStatusResponse para la API GET
+type JobStatusResponse struct {
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Status       string            `json:"status"`
+	Submitted    time.Time         `json:"submitted_at"`
+	DurationSecs float64           `json:"duration_secs"`
+	Progress     map[string]string `json:"node_status"` // NodeID -> Status
 }
