@@ -1,0 +1,35 @@
+{
+  "name": "wordcount-batch",
+  "dag": {
+    "nodes": [
+      {
+        "id": "read",
+        "op": "read_csv",
+        "path": "data/books.csv",
+        "partitions": 4
+      },
+      {
+        "id": "flat",
+        "op": "flat_map",
+        "fn": "tokenize"
+      },
+      {
+        "id": "map1",
+        "op": "map",
+        "fn": "to_lower"
+      },
+      {
+        "id": "agg",
+        "op": "reduce_by_key",
+        "key": "token",
+        "fn": "sum"
+      }
+    ],
+    "edges": [
+      ["read", "flat"],
+      ["flat", "map1"],
+      ["map1", "agg"]
+    ]
+  },
+  "parallelism": 4
+}
