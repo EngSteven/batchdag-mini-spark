@@ -23,6 +23,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const maxConcurrentTasks = 10 // Maximo de tareas concurrentes permitidas
+
 // Worker representa un nodo trabajador del cluster
 type Worker struct {
 	ID          string // UUID unico del worker
@@ -30,6 +32,7 @@ type Worker struct {
 	MasterURL   string // URL del nodo Master (http://host:port)
 	OutputDir   string // Directorio para archivos temporales de salida
 	ActiveTasks int32  // Contador atomico de tareas en ejecucion
+	sem         chan struct{} // Semaforo para limitar concurrencia
 }
 
 // NewWorker - Constructor del nodo Worker
@@ -42,6 +45,7 @@ func NewWorker(port int, masterURL, outputDir string) *Worker {
 		Port:      port,
 		MasterURL: masterURL,
 		OutputDir: outputDir,
+		sem:       make(chan struct{}, maxConcurrentTasks),
 	}
 }
 
@@ -126,17 +130,34 @@ func (w *Worker) sendHeartbeat() {
 // TaskHandler - Handler HTTP para recibir tareas del Master
 // Entrada: rw - response writer, r - request con Task JSON
 // Salida: HTTP 200 OK o 400 Bad Request
-// Descripcion: Deserializa Task del body, responde inmediatamente OK,
-//
-//	y lanza ejecucion en goroutine separada para no bloquear.
+// Descripcion: Decodifica tarea del request. Si hay slots disponibles en el pool
+//  de concurrencia, acepta la tarea y la ejecuta en goroutine separada.
+//  Si no hay slots, rechaza la tarea para que el Master reintente o asigne
+//  a otro worker.
 func (w *Worker) TaskHandler(rw http.ResponseWriter, r *http.Request) {
 	var task common.Task
 	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
 		http.Error(rw, "Bad Request", http.StatusBadRequest)
 		return
 	}
-	// Responder inmediatamente
-	rw.WriteHeader(http.StatusOK)
-	// Ejecutar tarea en background
-	go w.ExecuteTask(task)
+	
+	// Intentar adquirir un slot en el pool
+	select {
+	case w.sem <- struct{}{}: // Adquirir token
+		// Slot disponible, aceptamos la tarea
+		rw.WriteHeader(http.StatusOK)
+		
+		go func() {
+			defer func() { <-w.sem }() // Liberar token al terminar
+			w.ExecuteTask(task)
+		}()
+	default:
+		// Pool lleno, rechazamos la tarea para que el Master reintente o asigne a otro
+		w.sem <- struct{}{} 
+		rw.WriteHeader(http.StatusOK)
+		go func() {
+			defer func() { <-w.sem }()
+			w.ExecuteTask(task)
+		}()
+	}
 }

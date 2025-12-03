@@ -25,7 +25,10 @@ type Master struct {
 	JobProgress map[string]map[string]string // Progreso por nodo: JobID -> NodeID -> Estado
 	JobOutputs  map[string]map[string]string // Archivos de salida: JobID -> NodeID -> Path
 	JobFailures map[string]int               // Contador de fallos: JobID -> Num fallos
-
+	
+	JobPartitionOutputs map[string]map[string]map[int]string // Salidas por particion: JobID -> NodeID -> PartitionID -> Path
+	TaskProgress map[string]map[string]map[int]string // Progreso por tarea: JobID -> NodeID -> PartitionID -> Status
+	
 	TaskQueue       chan common.Task       // Cola de tareas pendientes (buffered channel)
 	TaskAssignments map[string]string      // Asignaciones activas: TaskID -> WorkerID
 	RunningTasks    map[string]common.Task // Tareas en ejecucion: TaskID -> Task
@@ -50,6 +53,8 @@ func NewMaster(stateFile string) *Master {
 		JobProgress:     make(map[string]map[string]string),
 		JobOutputs:      make(map[string]map[string]string),
 		JobFailures:     make(map[string]int),
+		JobPartitionOutputs: make(map[string]map[string]map[int]string),
+		TaskProgress:    make(map[string]map[string]map[int]string),
 		TaskQueue:       make(chan common.Task, 100), // Buffer de 100 tareas
 		TaskAssignments: make(map[string]string),
 		RunningTasks:    make(map[string]common.Task),
@@ -68,9 +73,11 @@ func (m *Master) InitJobProgress(job *common.Job) {
 	if _, ok := m.JobProgress[job.ID]; !ok {
 		m.JobProgress[job.ID] = make(map[string]string)
 	}
-	// Crear mapa de outputs si no existe
-	if _, ok := m.JobOutputs[job.ID]; !ok {
-		m.JobOutputs[job.ID] = make(map[string]string)
+	if _, ok := m.TaskProgress[job.ID]; !ok {
+		m.TaskProgress[job.ID] = make(map[string]map[int]string)
+	}
+	if _, ok := m.JobPartitionOutputs[job.ID]; !ok {
+		m.JobPartitionOutputs[job.ID] = make(map[string]map[int]string)
 	}
 	// Inicializar contador de fallos en 0
 	if _, ok := m.JobFailures[job.ID]; !ok {
@@ -79,6 +86,16 @@ func (m *Master) InitJobProgress(job *common.Job) {
 	// Marcar todos los nodos como PENDING
 	for _, node := range job.Graph.Nodes {
 		m.JobProgress[job.ID][node.ID] = "PENDING"
+		// Inicializar estado de cada partición
+		m.TaskProgress[job.ID][node.ID] = make(map[int]string)
+		
+		// Usar Parallelism del Job, default 1
+		p := job.Parallelism
+		if p < 1 { p = 1 }
+		
+		for i := 0; i < p; i++ {
+			m.TaskProgress[job.ID][node.ID][i] = "PENDING"
+		}
 	}
 }
 
@@ -95,6 +112,16 @@ func (m *Master) getNodeStatus(jobID, nodeID string) string {
 	return "PENDING"
 }
 
+// getPartitionStatus consulta el estado de una partición específica
+func (m *Master) getPartitionStatus(jobID, nodeID string, partID int) string {
+	if jobMap, ok := m.TaskProgress[jobID]; ok {
+		if nodeMap, ok := jobMap[nodeID]; ok {
+			return nodeMap[partID]
+		}
+	}
+	return "PENDING"
+}
+
 // setNodeStatus - Actualiza estado de un nodo en un job
 // Entrada: jobID - ID del job, nodeID - ID del nodo, status - nuevo estado
 // Salida: ninguna (void)
@@ -104,6 +131,16 @@ func (m *Master) setNodeStatus(jobID, nodeID, status string) {
 		m.JobProgress[jobID] = make(map[string]string)
 	}
 	m.JobProgress[jobID][nodeID] = status
+}
+
+func (m *Master) setPartitionStatus(jobID, nodeID string, partID int, status string) {
+	if _, ok := m.TaskProgress[jobID]; !ok {
+		m.TaskProgress[jobID] = make(map[string]map[int]string)
+	}
+	if _, ok := m.TaskProgress[jobID][nodeID]; !ok {
+		m.TaskProgress[jobID][nodeID] = make(map[int]string)
+	}
+	m.TaskProgress[jobID][nodeID][partID] = status
 }
 
 // SaveState - Persiste estado del Master a disco en formato JSON
@@ -182,6 +219,11 @@ func (m *Master) LoadState() {
 		if job.Status == "COMPLETED" {
 			for _, node := range job.Graph.Nodes {
 				m.setNodeStatus(job.ID, node.ID, "COMPLETED")
+				p := job.Parallelism
+				if p < 1 { p = 1 }
+				for i := 0; i < p; i++ {
+					m.setPartitionStatus(job.ID, node.ID, i, "COMPLETED")
+				}
 			}
 		}
 	}
