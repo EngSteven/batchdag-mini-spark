@@ -1,0 +1,11 @@
+{
+  "name": "FAIL_TEST_DELAY",
+  "dag": {
+    "nodes": [
+      {"id": "read_delay", "op": "read_csv", "path": "data/users.csv"},
+      {"id": "map_delay",  "op": "map",      "fn": "sleep_10s"}
+    ],
+    "edges": [["read_delay", "map_delay"]]
+  },
+  "parallelism": 1
+}

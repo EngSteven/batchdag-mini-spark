@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // --- UDFs (Funciones de Usuario) ---
@@ -30,6 +31,13 @@ var MapFunctions = map[string]func(string) string{
 		}
 		return fmt.Sprintf(`{"key": "%s", "value": "%s"}`, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
 	},
+	// --- Funcion extra solo para pruebas ---
+  "sleep_10s": func(s string) string {
+      // Duerme 10 segundos antes de retornar
+      // Esto ocurrirá POR CADA LÍNEA del archivo CSV
+      time.Sleep(10 * time.Second) 
+      return s 
+  },
 }
 
 // FilterFunctions - Registro de funciones filter (predicados)

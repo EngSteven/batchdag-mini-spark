@@ -99,6 +99,15 @@ func (m *Master) SchedulerLoop() {
 		// Registrar asignacion tarea-worker
 		m.TaskAssignments[task.ID] = worker.ID
 		m.RunningTasks[task.ID] = task
+
+		// Loguear asignacion
+		utils.LogJSON("INFO", "Asignando tarea a worker", map[string]interface{}{
+        "task_id":    task.ID,
+        "node":       task.NodeID,
+        "worker_id":  worker.ID,
+        "worker_url": worker.URL,
+    })
+
 		m.mu.Unlock()
 		// Enviar tarea al worker en goroutine separada
 		go m.sendTask(worker, task)
@@ -117,6 +126,12 @@ func (m *Master) sendTask(worker *common.WorkerInfo, task common.Task) {
 	// Enviar POST a worker
 	resp, err := http.Post(worker.URL+"/task", "application/json", bytes.NewBuffer(data))
 	if err != nil {
+		// Loguear error de envio
+		utils.LogJSON("WARN", "Fallo envio de tarea (Reintentando)", map[string]interface{}{
+        "task_id": task.ID,
+        "worker":  worker.ID,
+        "error":   err.Error(),
+    })
 		// Si falla, liberar asignacion y reencolar
 		m.mu.Lock()
 		delete(m.TaskAssignments, task.ID)
@@ -191,8 +206,18 @@ func (m *Master) HealthCheckLoop() {
 						if task, ok := m.RunningTasks[tID]; ok {
 							// Liberar recursos
 							delete(m.TaskAssignments, tID)
+							oldID := task.ID
 							// Generar nuevo ID para evitar conflictos
 							task.ID = uuid.New().String()
+							
+							// Loguear replanificacion
+							utils.LogJSON("WARN", "Replanificando tarea (Worker muerto)", map[string]interface{}{
+                  "node":          task.NodeID,
+                  "failed_worker": wID,
+                  "old_task_id":   oldID,
+                  "new_task_id":   task.ID,
+              })
+
 							delete(m.RunningTasks, tID)
 							// Reencolar tarea
 							go func(t common.Task) { m.TaskQueue <- t }(task)

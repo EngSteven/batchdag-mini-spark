@@ -1,5 +1,5 @@
 # Reporte de Benchmarks - Mini-Spark
-**Fecha:** Tue Dec  2 21:31:31 CST 2025
+**Fecha:** Tue Dec  2 22:06:31 CST 2025
 
 ## 1. Entorno de Ejecución
 | Componente | Detalle |
@@ -16,8 +16,8 @@
 ## 3. Resultados
 | Benchmark | Job ID | Estado | Duración (s) |
 | --- | --- | --- | --- |
-| WordCount (Shuffle) | `f5a5c2b8-7904-4f41-8ea2-49622530575c` | EXITO | **8.578043743** |
-| Join (Large Dataset) | `4bbff9f8-0181-4152-a076-776d89f5970f` | EXITO | **2.397945294** |
+| WordCount (Shuffle) | `2e74f7df-f566-4c07-9e89-8ffaae324f95` | EXITO | **8.858501584** |
+| Join (Large Dataset) | `e4258a55-9de6-47a7-b27d-964810f7fc67` | EXITO | **2.481913823** |
 
 ---
 *Reporte generado automáticamente por script de prueba.*

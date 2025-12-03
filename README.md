@@ -228,29 +228,6 @@ http://localhost:8080/api/v1/jobs/<JOB_ID>/results
 
 ## Pruebas Disponibles
 
-Se tienen 3 tipos de prueba, por scripts, manuales y automatizadas
-
-
-### Scripts
-
-
-**Demo**
-Agrega descripcion
-```bash
-chmod +x scripts/run_demo.sh
-./scripts/run_demo.sh
-```
-
-**Benchmark**
-
-### Manuales
-
-### Automatizadas
-
-
-
-## Pruebas Disponibles
-
 Se tienen 3 tipos de prueba: por scripts, manuales y automatizadas.
 
 ### Scripts
