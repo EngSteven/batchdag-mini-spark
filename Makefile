@@ -1,10 +1,10 @@
-# --- VARIABLES ---
+# --- VARIABLES DE CONFIGURACIÓN ---
 BINARY_DIR=bin
 MASTER_BIN=$(BINARY_DIR)/master
 WORKER_BIN=$(BINARY_DIR)/worker
 CLIENT_BIN=$(BINARY_DIR)/client
 
-# Directorios de datos
+# Directorios de datos y logs
 DATA_DIR=data
 TMP_DIR=/tmp/mini-spark
 SHARED_TMP=tmp_shared
@@ -16,113 +16,114 @@ LOG_DIR=logs
 # 1. ENTORNO LOCAL (Desarrollo / WSL)
 # ==========================================
 
-# Compilar todos los binarios
+# Compilación de todos los binarios
 build:
-	@echo "🛠️  Compilando binarios..."
+	@echo "[BUILD] Compilando binarios..."
 	@mkdir -p $(BINARY_DIR)
 	@go build -o $(MASTER_BIN) cmd/master/main.go
 	@go build -o $(WORKER_BIN) cmd/worker/main.go
 	@go build -o $(CLIENT_BIN) cmd/client/main.go
-	@echo "✅ Compilación exitosa."
+	@echo "[OK] Compilación exitosa."
 
-# Limpiar binarios, temporales y logs
+# Limpieza de binarios, archivos temporales y logs
 clean: stop
-	@echo "🧹 Limpiando sistema local..."
+	@echo "[CLEAN] Limpiando entorno local..."
 	@rm -rf $(BINARY_DIR)
 	@rm -rf $(TMP_DIR)/*
 	@rm -rf $(LOG_DIR)
 	@rm -f master_state.json
-	@echo "✨ Sistema limpio."
+	@echo "[OK] Sistema limpio."
 
-# Levantar Master y 2 Workers (Logs en carpeta logs/)
+# Ejecución del Cluster en segundo plano (Background)
+# Redirige stdout/stderr a archivos en logs/
 run-cluster: build
-	@echo "🚀 Iniciando Cluster Local..."
+	@echo "[INFO] Iniciando Cluster Local..."
 	@mkdir -p $(TMP_DIR)
 	@mkdir -p $(LOG_DIR)
-	@# Iniciamos Master
+	@# Iniciar Master
 	@./$(MASTER_BIN) > $(LOG_DIR)/master.log 2>&1 & echo $$! > $(LOG_DIR)/master.pid
-	@echo "   -> Master iniciado (PID en $(LOG_DIR)/master.pid). Logs en $(LOG_DIR)/master.log"
+	@echo "   -> Master iniciado (PID en $(LOG_DIR)/master.pid). Logs: $(LOG_DIR)/master.log"
 	@sleep 2
-	@# Iniciamos Worker 1
+	@# Iniciar Worker 1
 	@./$(WORKER_BIN) -port 9001 > $(LOG_DIR)/worker1.log 2>&1 & echo $$! > $(LOG_DIR)/worker1.pid
-	@echo "   -> Worker 1 iniciado (PID en $(LOG_DIR)/worker1.pid). Logs en $(LOG_DIR)/worker1.log"
-	@# Iniciamos Worker 2
+	@echo "   -> Worker 1 iniciado (PID en $(LOG_DIR)/worker1.pid). Logs: $(LOG_DIR)/worker1.log"
+	@# Iniciar Worker 2
 	@./$(WORKER_BIN) -port 9002 > $(LOG_DIR)/worker2.log 2>&1 & echo $$! > $(LOG_DIR)/worker2.pid
-	@echo "   -> Worker 2 iniciado (PID en $(LOG_DIR)/worker2.pid). Logs en $(LOG_DIR)/worker2.log"
-	@echo "✅ Cluster listo."
+	@echo "   -> Worker 2 iniciado (PID en $(LOG_DIR)/worker2.pid). Logs: $(LOG_DIR)/worker2.log"
+	@echo "[OK] Cluster operativo."
 
-# Levantar solo Master (bloqueante)
+# Ejecución de Master (Primer plano / Foreground)
 run-master: build
-	@echo "👑 Iniciando Master..."
+	@echo "[INFO] Iniciando Master..."
 	@mkdir -p $(TMP_DIR)
 	@./$(MASTER_BIN)
 
-# Levantar Worker 1 (bloqueante)
+# Ejecución de Worker 1 (Primer plano / Foreground)
 run-worker-1: build
-	@echo "👷 Iniciando Worker 1 (Puerto 9001)..."
+	@echo "[INFO] Iniciando Worker 1 (Puerto 9001)..."
 	@./$(WORKER_BIN) -port 9001
 
-# Levantar Worker 2 (bloqueante)
+# Ejecución de Worker 2 (Primer plano / Foreground)
 run-worker-2: build
-	@echo "👷 Iniciando Worker 2 (Puerto 9002)..."
+	@echo "[INFO] Iniciando Worker 2 (Puerto 9002)..."
 	@./$(WORKER_BIN) -port 9002
 
-# Detener todos los procesos de forma SEGURA
+# Detención segura de procesos
 stop:
-	@echo "🛑 Deteniendo cluster..."
-	@# 1. Matar por PID guardado (Usamos -9 para asegurar muerte inmediata y liberar puerto)
+	@echo "[STOP] Deteniendo servicios del cluster..."
+	@# 1. Terminación por PID específico (SIGKILL para liberación inmediata de puertos)
 	@if [ -f $(LOG_DIR)/master.pid ]; then \
 		pid=$$(cat $(LOG_DIR)/master.pid); \
-		if [ -n "$$pid" ]; then kill -9 $$pid 2>/dev/null || true; echo "   -> Master PID $$pid eliminado."; fi; \
+		if [ -n "$$pid" ]; then kill -9 $$pid 2>/dev/null || true; echo "   -> Master PID $$pid terminado."; fi; \
 		rm -f $(LOG_DIR)/master.pid; \
 	fi
 	@if [ -f $(LOG_DIR)/worker1.pid ]; then \
 		pid=$$(cat $(LOG_DIR)/worker1.pid); \
-		if [ -n "$$pid" ]; then kill -9 $$pid 2>/dev/null || true; echo "   -> Worker 1 PID $$pid eliminado."; fi; \
+		if [ -n "$$pid" ]; then kill -9 $$pid 2>/dev/null || true; echo "   -> Worker 1 PID $$pid terminado."; fi; \
 		rm -f $(LOG_DIR)/worker1.pid; \
 	fi
 	@if [ -f $(LOG_DIR)/worker2.pid ]; then \
 		pid=$$(cat $(LOG_DIR)/worker2.pid); \
-		if [ -n "$$pid" ]; then kill -9 $$pid 2>/dev/null || true; echo "   -> Worker 2 PID $$pid eliminado."; fi; \
+		if [ -n "$$pid" ]; then kill -9 $$pid 2>/dev/null || true; echo "   -> Worker 2 PID $$pid terminado."; fi; \
 		rm -f $(LOG_DIR)/worker2.pid; \
 	fi
-	@# 2. Limpieza de respaldo por nombre EXACTO de proceso (evita matar 'make')
+	@# 2. Limpieza de respaldo por nombre de proceso (match exacto)
 	@pkill -9 -x "master" || true
 	@pkill -9 -x "worker" || true
-	@echo "✅ Procesos detenidos y puertos liberados."
+	@echo "[OK] Procesos detenidos y puertos liberados."
 
-# Ejecutar todas las pruebas (Unitarias, Integración, E2E)
+# Ejecución de suite de pruebas (Unitarias, Integración, E2E)
 test:
-	@echo "🧪 Ejecutando suite de pruebas..."
-	@# Aseguramos limpieza previa para que el E2E no choque con procesos vivos
+	@echo "[TEST] Ejecutando suite de pruebas..."
+	@# Limpieza previa para evitar conflictos con procesos activos
 	@$(MAKE) stop > /dev/null 2>&1 || true
 	@go test -v ./tests/...
-	@echo "✅ Pruebas finalizadas."
+	@echo "[OK] Pruebas finalizadas."
 
 # ==========================================
 # 2. ENTORNO DOCKER (Entrega / Demo)
 # ==========================================
 
-# Solo compilar imágenes
+# Construcción de imágenes
 docker-build:
-	@echo "🐳 Construyendo imágenes Docker..."
+	@echo "[DOCKER] Construyendo imágenes..."
 	@docker-compose build
 
-# Levantar cluster
+# Despliegue del cluster
 docker-up:
-	@echo "🐳 Levantando contenedores en primer plano (Ctrl+C para detener)..."
-	@echo "⚠️  IMPORTANTE: Los resultados estarán en la carpeta '$(SHARED_TMP)' de tu PC."
+	@echo "[DOCKER] Iniciando contenedores (Ctrl+C para detener)..."
+	@echo "[INFO] Los resultados se mapearán en el directorio local '$(SHARED_TMP)'."
 	@mkdir -p $(SHARED_TMP)
 	@chmod 777 $(SHARED_TMP)
 	@docker-compose up --scale worker-1=1 --scale worker-2=1
 
-# Compilar + Levantar
+# Alias: Construir y Desplegar
 docker-run: docker-build docker-up
 
-# Limpiar Docker
+# Limpieza profunda de Docker
 docker-clean:
-	@echo "🐳 Bajando contenedores y limpiando..."
+	@echo "[DOCKER] Deteniendo contenedores y eliminando volúmenes..."
 	@docker-compose down -v
-	@# Limpieza de archivos creados por docker (root)
+	@# Limpieza de archivos generados por root dentro del contenedor
 	@docker run --rm -v $(PWD)/$(SHARED_TMP):/clean alpine rm -rf /clean/* || true
-	@echo "✨ Docker limpio."
+	@echo "[OK] Entorno Docker limpio."
