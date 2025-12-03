@@ -39,15 +39,45 @@ func (w *Worker) ExecuteTask(task common.Task) {
 	atomic.AddInt32(&w.ActiveTasks, 1)
 	defer atomic.AddInt32(&w.ActiveTasks, -1)
 
-	fmt.Printf("[WORKER %d] Ejecutando %s (Op: %s)\n", w.Port, task.NodeID, task.Op)
-	// Construir path de archivo de salida
-	outputFile := fmt.Sprintf("%s/%s_%s.txt", w.OutputDir, task.JobID, task.NodeID)
-
+	fmt.Printf("[WORKER %d] Ejecutando %s (Part: %d, Op: %s)\n", w.Port, task.NodeID, task.PartitionID, task.Op)	// Construir path de archivo de salida
+	outputFile := fmt.Sprintf("%s/%s_%s_part%d.txt", w.OutputDir, task.JobID, task.NodeID, task.PartitionID)
+	
 	var err error
 	// Ejecutar operador segun tipo de tarea
 	switch task.Op {
 	case "read_csv", "read_jsonl":
-		err = operators.ReadCSV(task.Args[0], outputFile)
+
+		originalPath := task.Args[0]
+        
+		// Si hay mas de 1 partición, intentamos buscar el archivo fragmentado
+		if task.TotalPartitions > 1 {
+				
+				ext := ".csv"
+				if strings.HasSuffix(originalPath, ".jsonl") {
+						ext = ".jsonl"
+				} else if strings.HasSuffix(originalPath, ".txt") {
+						ext = ".txt"
+				}
+				
+				baseName := strings.TrimSuffix(originalPath, ext)
+				partitionedPath := fmt.Sprintf("%s_part%d%s", baseName, task.PartitionID, ext)
+				
+				// Verificamos si existe el archivo particionado
+				if _, e := os.Stat(partitionedPath); e == nil {
+						fmt.Printf("[WORKER] Usando partición física: %s\n", partitionedPath)
+						err = operators.ReadCSV(partitionedPath, outputFile)
+				} else {
+						// Si no existe, advertimos y leemos el original (fallback)
+						fmt.Printf("[WORKER] WARN: No existe %s, leyendo original completo.\n", partitionedPath)
+						err = operators.ReadCSV(originalPath, outputFile)
+				}
+		} else {
+				// Si no hay paralelismo, leemos el archivo entero tal cual
+				err = operators.ReadCSV(originalPath, outputFile)
+		}
+
+
+
 	case "map":
 		err = operators.Map(task.InputFiles, outputFile, task.Fn)
 	case "flat_map":
@@ -84,7 +114,7 @@ func (w *Worker) ExecuteTask(task common.Task) {
 //
 //	Reintenta hasta 3 veces si falla la conexion.
 func (w *Worker) reportCompletion(task common.Task, status, resPath, err string) {
-	res := common.TaskResult{ID: task.ID, JobID: task.JobID, NodeID: task.NodeID, Status: status, Result: resPath, ErrorMsg: err}
+	res := common.TaskResult{ID: task.ID, JobID: task.JobID, NodeID: task.NodeID, PartitionID: task.PartitionID, Status: status, Result: resPath, ErrorMsg: err}
 	data, _ := json.Marshal(res)
 	// Reintentar hasta 3 veces
 	for i := 0; i < 3; i++ {

@@ -39,11 +39,19 @@ func (m *Master) ScheduleSourceTasks(job *common.Job) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	parallelism := job.Parallelism
+	if parallelism < 1 {
+		parallelism = 1
+	}
+
 	// Encolar todos los nodos sin dependencias (source nodes)
 	for _, node := range job.Graph.Nodes {
 		if inDegree[node.ID] == 0 {
-			// Nodo source - encolar con lista de inputs vacia
-			m.queueTask(job.ID, node, []string{})
+			// NODO SOURCE: Crear N tareas (una por partición)
+			for i := 0; i < parallelism; i++ {
+				m.queueTask(job.ID, node, []string{}, i, parallelism)
+			}
 		}
 	}
 }
@@ -54,17 +62,32 @@ func (m *Master) ScheduleSourceTasks(job *common.Job) {
 // Descripcion: Construye objeto Task, actualiza estado a SCHEDULED,
 //
 //	y lo inserta en TaskQueue para asignacion a workers.
-func (m *Master) queueTask(jobID string, node common.DAGNode, inputs []string) {
-	// Marcar nodo como programado
-	m.setNodeStatus(jobID, node.ID, "SCHEDULED")
-	// Construir objeto Task
+func (m *Master) queueTask(jobID string, node common.DAGNode, inputs []string, partID, totalParts int) {
+	// Marcar estado de la partición específica
+	m.setPartitionStatus(jobID, node.ID, partID, "SCHEDULED")
+	
+	// Si alguna partición corre, el nodo está RUNNING
+	m.setNodeStatus(jobID, node.ID, "RUNNING")
+
 	task := common.Task{
-		ID: uuid.New().String(), JobID: jobID, NodeID: node.ID, Op: node.Op, Fn: node.Fn,
-		Args: []string{node.Path}, InputFiles: inputs, Attempt: 1,
+		ID:              uuid.New().String(),
+		JobID:           jobID,
+		NodeID:          node.ID,
+		Op:              node.Op,
+		Fn:              node.Fn,
+		Args:            []string{node.Path},
+		InputFiles:      inputs,
+		PartitionID:     partID,     // Asignamos ID
+		TotalPartitions: totalParts, // Total
+		Attempt:         1,
 	}
-	// Encolar tarea en canal bloqueante
+
 	m.TaskQueue <- task
-	utils.LogJSON("INFO", "Tarea encolada", map[string]interface{}{"task_id": task.ID, "node": node.ID})
+	utils.LogJSON("INFO", "Tarea encolada", map[string]interface{}{
+		"task_id": task.ID, 
+		"node": node.ID, 
+		"part": partID,
+	})
 }
 
 // SchedulerLoop - Loop principal de asignacion de tareas a workers
@@ -104,8 +127,9 @@ func (m *Master) SchedulerLoop() {
 		utils.LogJSON("INFO", "Asignando tarea a worker", map[string]interface{}{
         "task_id":    task.ID,
         "node":       task.NodeID,
-        "worker_id":  worker.ID,
-        "worker_url": worker.URL,
+        "part":       task.PartitionID,
+				"worker_id":  worker.ID,
+				"worker_url": worker.URL,
     })
 
 		m.mu.Unlock()
@@ -143,35 +167,60 @@ func (m *Master) sendTask(worker *common.WorkerInfo, task common.Task) {
 }
 
 func (m *Master) CheckAndScheduleDependents(job *common.Job) {
+	parallelism := job.Parallelism
+	if parallelism < 1 { parallelism = 1 }
+
 	for _, node := range job.Graph.Nodes {
-		if m.getNodeStatus(job.ID, node.ID) != "PENDING" {
-			continue
-		}
-		allParentsDone := true
-		hasParents := false
-		var inputFiles []string
-		for _, edge := range job.Graph.Edges {
-			if edge[1] == node.ID {
-				hasParents = true
-				if m.getNodeStatus(job.ID, edge[0]) != "COMPLETED" {
-					allParentsDone = false
-					break
-				}
-				inputFiles = append(inputFiles, m.JobOutputs[job.ID][edge[0]])
+		// Buscamos particiones pendientes de este nodo
+		for i := 0; i < parallelism; i++ {
+			status := m.getPartitionStatus(job.ID, node.ID, i)
+			if status != "PENDING" {
+				continue // Ya fue programada o completada
 			}
-		}
-		if hasParents && allParentsDone {
-			m.queueTask(job.ID, node, inputFiles)
+
+			// Verificar padres de ESTA partición (Mapeo 1-a-1)
+			allParentsDone := true
+			hasParents := false
+			var inputFiles []string
+
+			for _, edge := range job.Graph.Edges {
+				if edge[1] == node.ID { // edge[0] -> node
+					hasParents = true
+					parentID := edge[0]
+					
+					// Chequear si la partición 'i' del padre terminó
+					if m.getPartitionStatus(job.ID, parentID, i) != "COMPLETED" {
+						allParentsDone = false
+						break
+					}
+
+					// Recuperar archivo de salida de la partición 'i' del padre
+					if outputs, ok := m.JobPartitionOutputs[job.ID][parentID]; ok {
+						inputFiles = append(inputFiles, outputs[i])
+					}
+				}
+			}
+
+			if hasParents && allParentsDone {
+				// Programar la partición 'i' del nodo hijo
+				m.queueTask(job.ID, node, inputFiles, i, parallelism)
+			}
 		}
 	}
 }
 
 func (m *Master) CheckJobCompletion(job *common.Job) {
 	allDone := true
+	parallelism := job.Parallelism
+	if parallelism < 1 { parallelism = 1 }
+
 	for _, node := range job.Graph.Nodes {
-		if m.getNodeStatus(job.ID, node.ID) != "COMPLETED" {
-			allDone = false
-			break
+		// Verificar que TODAS las particiones estén completas
+		for i := 0; i < parallelism; i++ {
+			if m.getPartitionStatus(job.ID, node.ID, i) != "COMPLETED" {
+				allDone = false
+				break
+			}
 		}
 	}
 	if allDone {

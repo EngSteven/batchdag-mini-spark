@@ -6,7 +6,7 @@
         "id": "read",
         "op": "read_csv",
         "path": "data/books.csv",
-        "partitions": 4
+        "partitions": 1
       },
       {
         "id": "flat",
@@ -31,5 +31,5 @@
       ["map1", "agg"]
     ]
   },
-  "parallelism": 4
+  "parallelism": 1
 }

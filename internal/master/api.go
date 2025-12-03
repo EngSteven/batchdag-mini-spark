@@ -103,7 +103,7 @@ func (m *Master) SubmitJobHandler(w http.ResponseWriter, r *http.Request) {
 	// Generar ID unico para el job
 	jobID := uuid.New().String()
 	// Crear objeto Job con estado inicial RUNNING
-	job := &common.Job{ID: jobID, Name: req.Name, Status: "RUNNING", Graph: req.DAG, Submitted: time.Now()}
+	job := &common.Job{ID: jobID, Name: req.Name, Status: "RUNNING", Graph: req.DAG, Parallelism: req.Parallelism ,Submitted: time.Now()}
 
 	m.mu.Lock()
 	// Registrar job en mapa global
@@ -114,7 +114,7 @@ func (m *Master) SubmitJobHandler(w http.ResponseWriter, r *http.Request) {
 	m.SaveState()
 	m.mu.Unlock()
 
-	utils.LogJSON("INFO", "Job recibido", map[string]interface{}{"job_id": jobID})
+	utils.LogJSON("INFO", "Job recibido", map[string]interface{}{"job_id": jobID, "parellelism": job.Parallelism})
 	// Lanzar scheduler para procesar nodos source (sin dependencias)
 	go m.ScheduleSourceTasks(job)
 	// Responder con ID del job
@@ -245,26 +245,28 @@ func (m *Master) CompleteTaskHandler(w http.ResponseWriter, r *http.Request) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Eliminar asignacion de tarea a worker
+
+	// Eliminar asignacion de tarea
 	delete(m.TaskAssignments, res.ID)
-	// Recuperar tarea original para reintentos
+	
+	// Recuperar tarea original (para reintentos)
 	originalTask, taskFound := m.RunningTasks[res.ID]
 	delete(m.RunningTasks, res.ID)
 
-	// Manejo de tareas fallidas
+	// --- MANEJO DE FALLOS ---
 	if res.Status == "FAILED" {
-		// Incrementar contador de fallos del job
 		m.JobFailures[res.JobID]++
-		utils.LogJSON("ERROR", "Fallo en tarea", map[string]interface{}{"node": res.NodeID, "error": res.ErrorMsg})
-		// Reintentar si no se supero el limite de intentos
+		utils.LogJSON("ERROR", "Fallo en tarea", map[string]interface{}{
+			"node": res.NodeID, 
+			"part": res.PartitionID, 
+			"error": res.ErrorMsg,
+		})
+
 		if taskFound && originalTask.Attempt < common.MaxRetries {
 			originalTask.Attempt++
-			// Generar nuevo ID para el reintento
 			originalTask.ID = uuid.New().String()
-			// Reencolar tarea para reintento
 			go func(t common.Task) { m.TaskQueue <- t }(originalTask)
 		} else {
-			// Marcar job como fallido si se agotaron reintentos
 			if job, ok := m.Jobs[res.JobID]; ok {
 				job.Status = "FAILED"
 				job.Completed = time.Now()
@@ -275,22 +277,56 @@ func (m *Master) CompleteTaskHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Manejo de tareas exitosas
-	// Actualizar estado del nodo a COMPLETED
-	m.setNodeStatus(res.JobID, res.NodeID, "COMPLETED")
-	// Registrar archivo de salida
+	// --- MANEJO DE ÉXITO ---
+
+	// 1. Actualizar estado de la PARTICIÓN específica
+	m.setPartitionStatus(res.JobID, res.NodeID, res.PartitionID, "COMPLETED")
+
+	// 2. NUEVO: Verificar si TODAS las particiones del nodo terminaron
+	// Esto es necesario para que el API muestre el nodo como "COMPLETED"
+	if job, ok := m.Jobs[res.JobID]; ok {
+		isNodeDone := true
+		p := job.Parallelism
+		if p < 1 { p = 1 }
+
+		for i := 0; i < p; i++ {
+			// Si alguna partición NO está completa, el nodo sigue corriendo
+			if m.getPartitionStatus(res.JobID, res.NodeID, i) != "COMPLETED" {
+				isNodeDone = false
+				break
+			}
+		}
+
+		// Si todas las particiones terminaron, marcamos el Nodo completo
+		if isNodeDone {
+			m.setNodeStatus(res.JobID, res.NodeID, "COMPLETED")
+		}
+	}
+
+	// 3. Registrar Outputs
+	if _, ok := m.JobPartitionOutputs[res.JobID]; !ok {
+		m.JobPartitionOutputs[res.JobID] = make(map[string]map[int]string)
+	}
+	if _, ok := m.JobPartitionOutputs[res.JobID][res.NodeID]; !ok {
+		m.JobPartitionOutputs[res.JobID][res.NodeID] = make(map[int]string)
+	}
+	m.JobPartitionOutputs[res.JobID][res.NodeID][res.PartitionID] = res.Result
+
+	// Compatibilidad con CLI
 	if _, ok := m.JobOutputs[res.JobID]; !ok {
 		m.JobOutputs[res.JobID] = make(map[string]string)
 	}
 	m.JobOutputs[res.JobID][res.NodeID] = res.Result
-	utils.LogJSON("INFO", "Tarea completada", map[string]interface{}{"node": res.NodeID})
-	// Persistir estado actualizado
+
+	utils.LogJSON("INFO", "Tarea completada", map[string]interface{}{
+		"node": res.NodeID, 
+		"part": res.PartitionID,
+	})
+
 	m.SaveState()
 
 	if job, ok := m.Jobs[res.JobID]; ok {
-		// Intentar programar nodos dependientes
 		m.CheckAndScheduleDependents(job)
-		// Verificar si el job completo
 		m.CheckJobCompletion(job)
 	}
 	w.WriteHeader(http.StatusOK)

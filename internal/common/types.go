@@ -58,7 +58,7 @@ type HeartbeatRequest struct {
 type JobRequest struct {
 	Name        string `json:"name"`        // Nombre descriptivo del job
 	DAG         DAG    `json:"dag"`         // Grafo dirigido aciclico de operaciones
-	Parallelism int    `json:"parallelism"` // Nivel de paralelismo deseado (no usado actualmente)
+	Parallelism int    `json:"parallelism"` // Nivel de paralelismo deseado 
 }
 
 // DAG representa el grafo de ejecucion del job
@@ -85,6 +85,7 @@ type Job struct {
 	Graph     DAG       `json:"dag"`                    // DAG de operaciones
 	Submitted time.Time `json:"submitted_at"`           // Timestamp de envio
 	Completed time.Time `json:"completed_at,omitempty"` // Timestamp de finalizacion
+	Parallelism int       `json:"parallelism"`
 }
 
 // Task representa una unidad de trabajo asignada a un worker
@@ -96,7 +97,8 @@ type Task struct {
 	Fn         string   `json:"fn"`          // Funcion UDF (si aplica)
 	Args       []string `json:"args"`        // Argumentos (ej: path de archivo)
 	InputFiles []string `json:"input_files"` // Archivos de entrada (outputs de nodos padre)
-	Partition  int      `json:"partition"`   // Numero de particion (no usado)
+	PartitionID     int      `json:"partition_id"`	// ID de particion 
+	TotalPartitions int      `json:"total_partitions"` // Total particiones
 	Attempt    int      `json:"attempt"`     // Contador de reintentos (1-3)
 }
 
@@ -105,6 +107,7 @@ type TaskResult struct {
 	ID       string `json:"id"`                  // UUID de la tarea
 	JobID    string `json:"job_id"`              // Job al que pertenece
 	NodeID   string `json:"node_id"`             // Nodo del DAG
+	PartitionID int    `json:"partition_id"`				// ID de particion
 	Status   string `json:"status"`              // COMPLETED | FAILED
 	Result   string `json:"result"`              // Ruta del archivo de salida
 	ErrorMsg string `json:"error_msg,omitempty"` // Mensaje de error si fallo
