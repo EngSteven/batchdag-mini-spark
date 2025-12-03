@@ -29,5 +29,5 @@
       ["map", "count"]
     ]
   },
-  "parallelism": 4
+  "parallelism": 1
 }

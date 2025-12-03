@@ -128,7 +128,8 @@ func (m *Master) SchedulerLoop() {
         "task_id":    task.ID,
         "node":       task.NodeID,
         "part":       task.PartitionID,
-				"worker":     worker.ID,
+				"worker_id":  worker.ID,
+				"worker_url": worker.URL,
     })
 
 		m.mu.Unlock()

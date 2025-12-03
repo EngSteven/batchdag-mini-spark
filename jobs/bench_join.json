@@ -23,5 +23,5 @@
       ["read_sales", "join_products"]
     ]
   },
-  "parallelism": 4
+  "parallelism": 1
 }
